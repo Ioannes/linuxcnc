@@ -1,0 +1,472 @@
+# JOYPAD.HAL
+# This HAL file configures the joypad to run a CNC mill with manual control. Normally, the two joysticks
+# will move the three axes freely. When one of the buttons is pressed, it will shift to a jog mode and 
+# move once in the direction of the pressed axis.
+# This file may seem daunting at first, but if you read just one section, then it will be much easier.
+# We will use hal_joystick to read the axis value (float) for X Y Z, we will send these values to the 
+# speed pin of a sim-encoder component, for X Y Z, this component outputs Phase-A and Phase-B signal, 
+# just like a real quadrature rotary encoder. We will decode those signals with an encoder component for X Y Z
+# and will send the result counts value to the axis jog pin for X Y Z.
+#----------------------------------------------------------------------------------------
+# Load joystick into thread
+#----------------------------------------------------------------------------------------
+#Updated to use the newer hal_input with the faster machine. Dual here refers to a 
+#unique identifier for the particular joypad that we're using. Check YOUR computer for
+#a unique identifier for YOUR joypad.
+loadusr -W hal_input -KRAL Microsoft X-Box 360 pad
+#The joypad mapping is as follows:
+#Joypad button vs. EMC2 map:
+#1		input.0.btn-thumb
+#2		input.0.btn-thumbl
+#3		input.0.btn-y
+#4		input.0.btn-x
+#5		input.0.btn-pinkie
+#6		input.0.btn-joystick
+#7		input.0.btn-start  (Note that there is no "1" suffix)
+#8		input.0.btn-select
+#There are other mappings - from the terminal window, type "halrun -I" then load the 
+#"loadusr -W hal_input Dual" command, then use "show" to see all the inputs. To check
+#the mapping, enter "loadusr halmeter -s pin input.0.btn-start" (as an example). In order
+#to see what button or axes does what, you will have to waggle the joystick and write 
+#it down. There's no other way.
+#----------------------------------------------------------------------------------------
+# Load required components
+#----------------------------------------------------------------------------------------
+#If you're familiar with another programming language, this is (sort of) an #include 
+#section. We'll require some number of components. It starts at 0-index, so if you ask
+#for count=6, you get .0 to .5
+loadrt mux2 count=8
+loadrt flipflop count=2
+loadrt and2 count=2
+loadrt not count=8
+loadrt encoder num_chan=3 
+loadrt sim_encoder num_chan=3 
+loadrt conv_s32_bit count=6
+loadrt conv_bit_s32 count=6
+loadrt conv_s32_float count=10
+loadrt wcomp count=6
+loadrt edge count=3
+loadrt deadzone count=6
+loadrt offset count=3
+
+#----------------------------------------------------------------------------------------
+# Mapping Requirements: COMMENTS ONLY - THERE IS NO CODE IN THIS SECTION.
+#----------------------------------------------------------------------------------------
+# If you're setting up your own system, then ask the machinists what buttons should be
+# doing which function. 
+# [BUTTON-SAMPLES]
+# The requested button functions are as follows:
+# Painted button	function		mapping
+#	1 		spindle stop		input.0.btn-thumb
+#	2		spindle slow		input.0.btn-x
+#	3		spindle start		input.0.btn-start
+#	4		spindle faster		input.0.btn-pinkie
+#	5		set jog scale: 1/1000	input.0.btn-thumbl
+#	6		go from jog mode	input.0.btn-joystick	
+#	7		set jog scale: 4/10000	input.0.btn-y
+#	8		machine on		input.0.btn-select
+
+	
+#----------------------------------------------------------------------------------------------------------
+# Deadband Setup
+#----------------------------------------------------------------------------------------------------------
+# The joypad is a little jittery, so we're adding a deadzone. It's a $20 Logitech gaming pad, not a 
+# $1500 optical unit designed for precision milling. 
+
+# THE DEADBAND HAS GREATLY IMPROVED MILLING QUALITY ON OUR MACHINE
+
+# The units for the axes change because there are two ways of measuring the axes. Since we have to
+# measure the axes twice, we have to use both. The first section is float, the second is s32. If you
+# use halmeter to check the axis values, the reason for these values will become very clear.
+# Note that calibration will not let you get away without a deadband. See above - it's a $20 joypad.
+setp deadzone.0.center 		0
+setp deadzone.0.threshhold	.5
+setp deadzone.1.center 		0
+setp deadzone.1.threshhold	.5
+setp deadzone.2.center 		0
+setp deadzone.2.threshhold	.8
+
+# These units are different because a different measuring system is used.
+# Note that these will be converted to floats.
+setp deadzone.3.center 		511
+setp deadzone.3.threshhold	20
+setp deadzone.4.center 		511
+setp deadzone.4.threshhold	20
+setp deadzone.5.center 		127
+setp deadzone.5.threshhold	20
+
+# Map the raw axes to the deadzones so the deadzones have inputs.
+net Xjoydead deadzone.0.in => input.0.abs-x-position
+net Yjoydead deadzone.1.in => input.0.abs-y-position
+net Zjoydead deadzone.2.in => input.0.abs-rz-position
+
+#Counts are in s32, and deadzone requires float. Convert.
+net Xjogconv conv-s32-float.3.in => input.0.abs-x-counts 
+net Yjogconv conv-s32-float.4.in => input.0.abs-y-counts 
+net Zjogconv conv-s32-float.5.in => input.0.abs-rz-counts 
+
+net Xjogdead deadzone.3.in => conv-s32-float.3.out 
+net Yjogdead deadzone.4.in => conv-s32-float.4.out
+net Zjogdead deadzone.5.in => conv-s32-float.5.out
+
+
+	
+#----------------------------------------------------------------------------------------------------------
+# Axis movement mode - freewheeling or one-shot jog
+#----------------------------------------------------------------------------------------------------------
+# We will have the jog speed set up later. The order isn't relevant since human reaction speed
+# is so much lower than the thread duration.
+
+# Speaking of thread duration, it is **critical** that the edge pulse width is greater than the duration
+# of the thread that we're inserting these calculations into. The servo-thread is 400000, so the 
+# edge is set to 10x that. This gives us a nice, long pulse which is easily detectable by the thread and
+# is also usable in other calculations. You can lower this if you'd like, but you'll find that you'll get
+# intermittent jogging. It will move once every 2-3 presses instead of every press. It does NOT change the
+# jog amount - it's still a one-shot with the width set below in the jog speed section.
+
+# Set up the one-shot pulses. This will allow a jog at just one increment.  
+# x,y - 491 is the midpoint, 20 is min, 1003 is max. Window is 390 - 590
+# z - 127 is the midpoint, 1 is min, 255 is max. Window is 100 - 150
+setp wcomp.0.min 		390
+setp wcomp.0.max 		590
+setp wcomp.1.min 		20
+setp wcomp.1.max 		390
+setp edge.0.in-edge 		FALSE
+setp offset.0.offset 		-1
+setp edge.0.out-width-ns        4000000
+
+setp wcomp.2.min 		390
+setp wcomp.2.max 		590
+setp wcomp.3.min 		20
+setp wcomp.3.max 		390
+setp edge.1.in-edge 		FALSE
+setp offset.1.offset 		-1
+setp edge.1.out-width-ns        4000000
+
+setp wcomp.4.min 		100
+setp wcomp.4.max 		155
+setp wcomp.5.min 		5
+setp wcomp.5.max 		100
+setp edge.2.in-edge 		FALSE
+setp offset.2.offset 		-1
+setp edge.2.out-width-ns        1000000
+
+#------------------------------------------------------
+# Set up X axis one-shot
+#------------------------------------------------------
+# To set up the jogs as a one-shot, we have to build a small Rube Goldberg machine.
+# A window comparator will tell you if there IS a trigger, not which direction the 
+# pulse should go. That's where the invert output comes in. 
+
+# If the second comparator shows that we're in the lower half, then we offset the 
+# inverse of the pulse wave to get a negative pulse. We also use that second comparator
+# to trigger the mux to determine whether to send a positive of negative pulse.
+
+# All these conversions are required because the required components will only work with
+# certain types of inputs. Edge detection sends out a bit, and a mux requires a float.
+net Xwindow wcomp.0.in => deadzone.3.out
+net Xwindow wcomp.1.in => deadzone.3.out
+net XwindowInv not.0.in => wcomp.0.out
+net Xedge edge.0.in => not.0.out
+net Xupconv1 conv-bit-s32.0.in => edge.0.out
+net Xupconv2 conv-s32-float.0.in => conv-bit-s32.0.out
+
+net Xupconvinv1 conv-bit-s32.1.in => edge.0.out-invert
+net Xupconvinv2 conv-s32-float.2.in => conv-bit-s32.1.out
+net Xupconvinv3 offset.0.in => conv-s32-float.2.out
+
+net Xjogleft mux2.3.in0 => conv-s32-float.0.out
+net Xjogright mux2.3.in1 => offset.0.out
+net XjogDirection mux2.3.sel => wcomp.1.out
+net Xjoglink mux2.0.in1 => mux2.3.out
+#At this point, mux2.0 has the one-shot Xpulse as one of the inputs. 
+
+#------------------------------------------------------
+# Set up Y axis one-shot
+#------------------------------------------------------
+# To set up the jogs as a one-shot, we have to build a small Rube Goldberg machine.
+# A window comparator will tell you if there IS a trigger, not which direction the 
+# pulse should go. That's where the invert output comes in. 
+
+# If the second comparator shows that we're in the lower half, then we offset the 
+# inverse of the pulse wave to get a negative pulse. We also use that second comparator
+# to trigger the mux to determine whether to send a positive of negative pulse.
+
+# All these conversions are required because the required components will only work with
+# certain types of inputs. Edge detection sends out a bit, and a mux requires a float.
+net Ywindow wcomp.2.in => deadzone.4.out
+net Ywindow wcomp.3.in => deadzone.4.out
+net YwindowInv not.1.in => wcomp.2.out
+net Yedge edge.1.in => not.1.out
+net Yupconv1 conv-bit-s32.2.in => edge.1.out
+net Yupconv2 conv-s32-float.6.in => conv-bit-s32.2.out
+
+net Yupconvinv1 conv-bit-s32.3.in => edge.1.out-invert
+net Yupconvinv2 conv-s32-float.7.in => conv-bit-s32.3.out
+net Yupconvinv3 offset.1.in => conv-s32-float.7.out
+
+net Yjogleft mux2.4.in0 => conv-s32-float.6.out
+net Yjogright mux2.4.in1 => offset.1.out
+net YjogDirection mux2.4.sel => wcomp.3.out
+net Yjoglink mux2.1.in1 => mux2.4.out
+#At this point, mux2.1 has the one-shot Ypulse as one of the inputs. 
+
+#------------------------------------------------------
+# Set up Z axis one-shot
+#------------------------------------------------------
+# To set up the jogs as a one-shot, we have to build a small Rube Goldberg machine.
+# A window comparator will tell you if there IS a trigger, not which direction the 
+# pulse should go. That's where the invert output comes in. 
+
+# If the second comparator shows that we're in the lower half, then we offset the 
+# inverse of the pulse wave to get a negative pulse. We also use that second comparator
+# to trigger the mux to determine whether to send a positive of negative pulse.
+
+# All these conversions are required because the required components will only work with
+# certain types of inputs. Edge detection sends out a bit, and a mux requires a float.
+net Zwindow wcomp.4.in => deadzone.5.out
+net Zwindow wcomp.5.in => deadzone.5.out
+net ZwindowInv not.2.in => wcomp.4.out
+net Zedge edge.2.in => not.2.out
+net Zupconv1 conv-bit-s32.4.in => edge.2.out
+net Zupconv2 conv-s32-float.8.in => conv-bit-s32.4.out
+
+net Zupconvinv1 conv-bit-s32.5.in => edge.2.out-invert
+net Zupconvinv2 conv-s32-float.9.in => conv-bit-s32.5.out
+net Zupconvinv3 offset.2.in => conv-s32-float.9.out
+
+net Zjogleft mux2.5.in0 => conv-s32-float.8.out
+net Zjogright mux2.5.in1 => offset.2.out
+net ZjogDirection mux2.5.sel => wcomp.5.out
+net Zjoglink mux2.2.in1 => mux2.5.out
+#At this point, mux2.2 has the one-shot Zpulse as one of the inputs. 
+
+
+# We are setting up input.0.btn-joystick to be the mode selector. While released, it will change the output of 
+# the multiplexor. While held down, the three axis controllers will act as normal. In other words, 
+# the change will be in the loading section, before the axes are mapped to the encoder speeds.
+net axisMode input.0.btn-a  => not.5.in
+net axisMode input.0.btn-a => not.6.in
+net axisMode input.0.btn-a => not.7.in
+net axisMode0 not.5.out  => mux2.0.sel
+net axisMode1 not.6.out => mux2.1.sel
+net axisMode2 not.7.out => mux2.2.sel
+
+net XnormalInput deadzone.0.out => mux2.0.in0
+net YnormalInput deadzone.1.out => mux2.1.in0
+net ZnormalInput deadzone.2.out => mux2.2.in0
+
+
+# Create links between the axis pins and the speed pin of the sim-encoder for X Y Z
+net velX mux2.0.out => sim-encoder.0.speed
+net velY mux2.1.out => sim-encoder.1.speed
+net velZ mux2.2.out => sim-encoder.2.speed
+
+
+#-------------------------------------------------------
+# After this point, there is no change to the two modes.
+#-------------------------------------------------------
+# Create links between sim-encoder Phase-A and Phase-B and encoder Phase-A and Phase-B for X Y Z
+net XA sim-encoder.0.phase-A => encoder.0.phase-A
+net XB sim-encoder.0.phase-B => encoder.0.phase-B
+net YA sim-encoder.1.phase-A => encoder.1.phase-A
+net YB sim-encoder.1.phase-B => encoder.1.phase-B
+net ZA sim-encoder.2.phase-A => encoder.2.phase-A
+net ZB sim-encoder.2.phase-B => encoder.2.phase-B
+
+# Create links between encoder counts and jog counts for X Y Z
+net countX encoder.0.counts => axis.x.jog-counts
+net countY encoder.1.counts => axis.y.jog-counts
+net countZ encoder.2.counts => axis.z.jog-counts
+
+# Set parameter values
+setp encoder.0.position-scale           1
+setp encoder.0.x4-mode         		TRUE
+setp encoder.1.position-scale           1
+setp encoder.1.x4-mode         		TRUE
+setp encoder.2.position-scale           1 
+setp encoder.2.x4-mode         		TRUE
+setp encoder.capture-position.tmax      0
+setp encoder.update-counters.tmax       0
+setp sim-encoder.0.ppr     		95
+setp sim-encoder.0.scale            	-1
+setp sim-encoder.1.ppr     		95
+setp sim-encoder.1.scale            	1
+setp sim-encoder.2.ppr     		95
+setp sim-encoder.2.scale            	-1
+setp sim-encoder.make-pulses.tmax       0
+setp sim-encoder.update-speed.tmax      0
+
+# Enable jog for X Y Z
+setp axis.x.jog-enable 			TRUE
+setp axis.y.jog-enable 			TRUE
+setp axis.z.jog-enable 			TRUE
+
+
+#----------------------------------------------------------------------------------------------------------
+# Scale button - Set jog speed
+#----------------------------------------------------------------------------------------------------------
+# First, we select the two buttons for speed selection. We'll use 5 and 7 for 1/1000 and 4/10000, respectively.
+net button5 input.0.btn-thumbl => flipflop.0.reset
+net button7 input.0.btn-y => flipflop.0.set
+net button5 input.0.btn-thumbl => flipflop.1.reset
+net button7 input.0.btn-y => flipflop.1.set
+
+#Add the control for the mux by mapping it to the flip-flop. Thus, it will stay in the last state until it is 
+#changed.
+net chosenJogSpeed flipflop.0.out => mux2.6.sel
+net chosenJogDuration flipflop.1.out => mux2.7.sel
+
+#Now, map the jog scale values to the axes.
+net jogscale mux2.6.out => axis.x.jog-scale
+net jogscale mux2.6.out => axis.y.jog-scale
+net jogscale mux2.6.out => axis.z.jog-scale
+
+# Set parameters values 
+setp flipflop.0.tmax          	3750
+setp mux2.6.tmax         	3609
+
+# Set the two scale values. The output will equal in0 when FALSE and in1 when TRUE.
+setp mux2.6.in0          	0.1
+setp mux2.6.in1          	0.01
+
+
+#----------------------------------------------------------------------------------------------------------
+# Power on machine
+#----------------------------------------------------------------------------------------------------------
+# In this section, we provide a simple link to turn the machine on (i.e. press the orange button in AXIS)
+net JoypadMachineOn input.0.btn-select => halui.machine.on
+
+
+#----------------------------------------------------------------------------------------------------------
+# Activate spindle and change its speed.
+#----------------------------------------------------------------------------------------------------------
+# In this section, we will link the spindle to the joypad and have its speed set up to increase or decrease
+# based on other buttons. 
+#	1 		spindle stop		input.0.btn-thumb
+#	2		spindle slow		input.0.btn-x
+
+#	3		spindle start		input.0.btn-start
+#	4		spindle faster		input.0.btn-pinkie
+
+# 
+# We don't want to connect the joypad directly to the spindle. Instead, we set up the halui signal
+# so that we trigger the spindle from inside the fancy halui routines.
+
+
+#----------------------------------------------------------------------------------------------------------
+# Activate coolant
+#----------------------------------------------------------------------------------------------------------
+# A single joypad button will start and stop the coolant. This is where the logic will get away from you
+# if you blink. Drawing it on paper will help.
+# The most important part is that there are two and2 gates being used here.
+
+# We are mapping flood on to one AND gate, and flood off (NOT flood on) to another AND gate.
+net flood-is-on halui.flood.is-on => and2.0.in0
+net flood-is-on halui.flood.is-on => not.3.in
+net not-flood-is-on not.3.out     => and2.1.in0
+
+# At this point, one gate (0) is flood & button9; the other (1) is !flood & button9.
+# So if it's not flooding and you press the button, it will start.
+# If it is flooding and you press the button, it will stop.
+net floodOn and2.1.out => halui.flood.on
+net floodOff and2.0.out => halui.flood.off
+
+
+#----------------------------------------------------------------------------------------------------------
+# Software-based estop
+#----------------------------------------------------------------------------------------------------------
+
+#----------------------------------------------------------------------------------------------------------
+# Function Loading
+#----------------------------------------------------------------------------------------------------------
+# At the end, we add all the functions and parameters we have defined into the threads. Note that the order
+# is somewhat important. If you are updating the position based on a vlue, you must update the value then
+# update the position or you'll update based on old data. Likewise, if you are updating a value, make sure
+# that the values you are using for the calculation are updated. THIS IS RECURSIVE - in other words, make
+# sure that those values are, in turn, calculated based on updated values.
+
+# The first components to add are the deadzone calculations. This is because they basically interact directly
+# with the raw hardware values.
+addf deadzone.0 servo-thread
+addf deadzone.1 servo-thread
+addf deadzone.2 servo-thread
+addf deadzone.3 servo-thread
+addf deadzone.4 servo-thread
+addf deadzone.5 servo-thread
+addf conv-s32-float.3 servo-thread
+addf conv-s32-float.4 servo-thread
+addf conv-s32-float.5 servo-thread
+
+#And now we add the position and jog conversions. 
+addf wcomp.0 servo-thread
+addf wcomp.1 servo-thread
+addf wcomp.2 servo-thread
+addf wcomp.3 servo-thread
+addf wcomp.4 servo-thread
+addf wcomp.5 servo-thread
+
+addf edge.0 servo-thread
+addf edge.1 servo-thread
+addf edge.2 servo-thread
+
+addf not.0 servo-thread
+addf not.1 servo-thread
+addf not.2 servo-thread
+addf not.5 servo-thread
+addf not.6 servo-thread
+addf not.7 servo-thread
+
+addf offset.0.update-output servo-thread
+addf offset.1.update-output servo-thread
+addf offset.2.update-output servo-thread
+
+addf conv-s32-float.0 servo-thread
+addf conv-s32-float.1 servo-thread
+addf conv-s32-float.2 servo-thread
+addf conv-s32-float.6 servo-thread
+addf conv-s32-float.7 servo-thread
+addf conv-s32-float.8 servo-thread
+addf conv-s32-float.9 servo-thread
+
+addf mux2.3 servo-thread
+addf mux2.4 servo-thread
+addf mux2.5 servo-thread
+
+addf conv-s32-bit.0 servo-thread
+addf conv-s32-bit.1 servo-thread
+addf conv-s32-bit.2 servo-thread
+addf conv-s32-bit.3 servo-thread
+addf conv-s32-bit.4 servo-thread
+addf conv-s32-bit.5 servo-thread
+
+addf conv-bit-s32.0 servo-thread
+addf conv-bit-s32.1 servo-thread
+addf conv-bit-s32.2 servo-thread
+addf conv-bit-s32.3 servo-thread
+addf conv-bit-s32.4 servo-thread
+addf conv-bit-s32.5 servo-thread
+
+# Update the last set of multiplexors before the encoder
+addf mux2.0 servo-thread
+addf mux2.1 servo-thread
+addf mux2.2 servo-thread
+
+# Now that the positioning data is up to date, we update the encoders, both real and simulated. 
+addf encoder.capture-position servo-thread
+addf sim-encoder.update-speed servo-thread
+addf encoder.update-counters base-thread
+addf sim-encoder.make-pulses base-thread
+
+# Now we can update the speed values. They aren't that critical in terms of calculation order, since the user will have to 
+# look down, press the button, then resume. The computer will react millions of times faster than even the twitchiest 
+# gamer / machinist.
+addf flipflop.0 servo-thread
+addf mux2.6 servo-thread
+addf flipflop.1 servo-thread
+addf mux2.7 servo-thread
+
+# Coolant is the slowest possible thing we can add due to the lag and the pump.
+#addf and2.0 joy-thread
+#addf and2.1 joy-thread
+#addf not.3 joy-thread
