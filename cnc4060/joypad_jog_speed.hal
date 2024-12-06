@@ -21,16 +21,16 @@ addf joy_mux4 servo-thread
 # Set the jog speed for the joypad speed selection. Use numbers that make sense for your machine.
 #
 setp joy_mux4.in0 10.0   # Setting this input to 0 prevents motion unless one of the other buttons is pressed.
-setp joy_mux4.in1 10.0   # Max jog speed when first speed select button is pressed.
+setp joy_mux4.in1 50.0   # Max jog speed when first speed select button is pressed.
 setp joy_mux4.in2 300.0  # Max jog speed when second speed select button is pressed.
 setp joy_mux4.in3 1500.0 # Max jog speed when third speed select button is pressed.
 #
 # The following lines do the magic of setting the jog speed selection. You must hold at least one of the buttons while jogging.
 # Notice this does not fully decode the button possibilities. If you simultaneously press multiple buttons you will get the higher speed.
 #
-net slow   <= joy_or2_sel0.in0 			=> input.0.btn-a                # Button for selecting first jog speed.
-net medium <= joy_or2_sel1.in0 			=> input.0.btn-b                   # Button for selecting second jog speed.
-net fast   <= joy_or2_sel0.in1 joy_or2_sel1.in1 => input.0.btn-x # Button for selecting third jog speed.
+net slow   <= joy_or2_sel0.in0 			=> input.0.btn-x                # Button for selecting first jog speed.
+net medium <= joy_or2_sel1.in0 			=> input.0.btn-a                   # Button for selecting second jog speed.
+net fast   <= joy_or2_sel0.in1 joy_or2_sel1.in1 => input.0.btn-b # Button for selecting third jog speed.
 
 net joy-speed-sel0 <= joy_or2_sel0.out  => joy_mux4.sel0 
 net joy-speed-sel1 <= joy_or2_sel1.out  => joy_mux4.sel1 
@@ -71,5 +71,20 @@ net jog-y-analog <= mux2_y.out => mux2_y.in0 halui.joint.1.analog halui.axis.y.a
 net jog-z-analog <= mux2_z.out => mux2_z.in0 halui.joint.2.analog halui.axis.z.analog 
 net jog-a-analog <= mux2_a.out => mux2_a.in0 halui.joint.3.analog halui.axis.a.analog 
 
-net JoypadMachineOn input.0.btn-select => halui.estop.reset halui.machine.on
-net JoypadMachineEstop  input.0.btn-mode => halui.estop.activate
+net JoypadMachineOn     input.0.btn-select => halui.estop.reset halui.machine.on
+net JoypadMachineEstop  input.0.btn-mode   => halui.estop.activate
+net JoypadProgramRun    input.0.btn-start  => halui.program.run
+
+#Home All
+net JoypadHomeAll	input.0.btn-y	   => halui.home-all
+
+# zero offsets X Y Z A
+net OffsetToX input.0.abs-hat0x-is-neg halui.mdi-command-00
+net OffsetToY input.0.abs-hat0x-is-pos halui.mdi-command-01
+net OffsetToZ input.0.abs-hat0y-is-neg halui.mdi-command-02
+net OffsetToA input.0.abs-hat0y-is-pos halui.mdi-command-03
+
+# Go to xy0
+net move_xy_0 input.0.btn-tl halui.mdi-command-04
+net move_z_0  input.0.btn-tr halui.mdi-command-05
+
