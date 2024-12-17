@@ -52,12 +52,14 @@ addf mult2_z servo-thread
 addf mult2_a servo-thread
 
 setp mult2_x.in0 -1
-setp mult2_y.in0  1
+setp mult2_y.in0 -1
 setp mult2_z.in0 -1
 setp mult2_a.in0  5
 
-net jog-x-neg input.0.abs-x-position =>  mult2_x.in1
-net jog-y-neg input.0.abs-y-position =>  mult2_y.in1
+# Joy x to y axis
+# Joy y to x axys
+net jog-x-neg input.0.abs-y-position =>  mult2_x.in1
+net jog-y-neg input.0.abs-x-position =>  mult2_y.in1
 net jog-z-neg input.0.abs-ry-position => mult2_z.in1
 net jog-a-neg input.0.abs-rx-position => mult2_a.in1
 
